@@ -1,0 +1,553 @@
+---
+title: "MRR optimization subject to roughness constraint learning 2"
+author: "Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+## Loading libraries, defining experimental design, and getting measurement results.
+
+The same as done previously.
+
+```{r message = F, echo = F}
+library(rsm)
+library(MaxPro)
+library(dplyr)
+library(tidymodels)
+library(rules)
+library(baguette)
+library(finetune)
+library(ggpubr)
+library(DALEX)
+library(DALEXtra)
+library(forcats)
+library(metaheuristicOpt)
+```
+
+```{r message = F, echo = F}
+
+plan <- bbd(3,
+            n0 = 2,
+            coding = list(x1 ~ (fza - 0.875)/0.375,        # um/dente
+                          x2 ~ (fzt - 0.15)/0.05,   # mm/dente
+                          x3 ~ (vc - 40)/20),         # m/min
+            randomize = F)
+
+plan01 <- plan[,3:5]
+plan01$x1 <- (plan$x1 - min(plan$x1))/(max(plan$x1) - min(plan$x1))
+plan01$x2 <- (plan$x2 - min(plan$x2))/(max(plan$x2) - min(plan$x2))
+plan01$x3 <- (plan$x3 - min(plan$x3))/(max(plan$x3) - min(plan$x3))
+
+set.seed(7)
+plan_cand <- CandPoints(N = 6, p_cont = 3, l_disnum=NULL, l_nom=NULL)
+
+plan_rand <- MaxProAugment(as.matrix(plan01), plan_cand, nNew = 6,
+                           p_disnum=0, l_disnum=NULL, p_nom=0, l_nom=NULL)
+plan_rand2 <- data.frame(plan_rand$Design)
+colnames(plan_rand2) <- c("x1","x2", "x3")
+
+plan_rand2$x1 <- plan_rand2$x1*(max(plan$x1) - min(plan$x1)) + min(plan$x1)
+plan_rand2$x2 <- plan_rand2$x2*(max(plan$x2) - min(plan$x2)) + min(plan$x2)
+plan_rand2$x3 <- plan_rand2$x3*(max(plan$x3) - min(plan$x3)) + min(plan$x3)
+
+plan2 <- data.frame(plan_rand2)
+plan2$fza <- plan2$x1*0.375 + 0.875
+plan2$fzt <- plan2$x2*0.05 + 0.15
+plan2$vc  <- plan2$x3*20 + 40
+
+set.seed(5)
+plan2$run.order <- sample(1:nrow(plan2),nrow(plan2),replace=F)
+
+```
+
+```{r message = F, echo = F}
+plan_ <- rbind(plan2, plan2)
+
+rough <- c(1.9155556, 3.5155556, 1.0655556, 1.9655556, 1.7655556, 3.2655556, 1.1655556, 2.5655556, 3.1155556, 1.6655556, 3.2655556, 1.3655556, 1.9155556, 2.0155556, 1.9655556, 3.5155556, 0.9655556, 2.5155556, 1.6655556, 2.3155556, 1.6655556, 3.6155556, 0.7655556, 1.9655556, 0.8655556, 2.8155556, 1.0155556, 4.3155556, 2.9155556, 1.4155556, 4.7155556, 1.8655556, 1.8155556, 2.2155556, 1.7655556, 3.4655556, 0.8655556, 2.2155556, 2.3655556, 1.9155556)
+
+plan_ <- plan_ %>%
+  mutate(lc = rep(c("emulsion", "mql"), each = 20),
+         Ra = rough)
+
+plan_ <- plan_ %>%
+  select(fza,fzt,vc,lc,Ra)
+head(plan_)
+```
+
+```{r message = F, echo = F}
+set.seed(1501)
+plan_split <- initial_split(plan_, strata = lc)
+  
+plan_train <- training(plan_split)
+plan_test  <- testing(plan_split)
+
+set.seed(1502)
+plan_folds <- 
+  vfold_cv(v = 5, plan_train, repeats = 2)
+
+```
+
+### SVR radial model
+
+```{r}
+normalized_rec <- 
+  recipe(Ra ~ ., data = plan_train) %>% 
+  step_normalize(fza,fzt,vc) %>%
+  step_dummy(all_nominal_predictors())
+
+svm_r_spec <- 
+  svm_rbf(cost = 3.17, rbf_sigma = 0.0774) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+svm_wflow <- 
+  workflow() %>%
+    add_model(svm_r_spec) %>%
+  add_recipe(normalized_rec)
+
+svm_final_fit <- fit(svm_wflow, data = plan_train)
+```
+
+```{r}
+augment(svm_final_fit, new_data = plan_test) %>%
+  rsq(truth = Ra, estimate = .pred)
+```
+
+```{r}
+augment(svm_final_fit, new_data = plan_test) %>%
+  rmse(truth = Ra, estimate = .pred)
+```
+
+```{r}
+svm_fit <- svm_final_fit %>% 
+  extract_fit_parsnip()
+
+svm_fit 
+```
+
+### Optimization of material removal rate with Ra contraint learning
+
+First MRR function is defined.
+
+```{r}
+MRR <- function(x){
+
+  z <- 2
+  Db <- 25
+  Dt <- 14
+  Dh <- Db-Dt
+  
+  f1 <- 250*z*(Db^3/(Dh*Dt))*x[3]*((x[1]*10^-3)/x[2])*sqrt((x[1]*10^-3)^2 + (x[2]*Dh/Db)^2)
+  
+  return(f1)
+} 
+
+```
+
+Writing Cubist constraint. Change lc (`"emulsion"` or `"mql"`) as desired.
+
+```{r}
+g1 <- function(x) {
+  g1 <- predict(svm_final_fit, new_data = data.frame(fza = x[1], 
+                                                     fzt = x[2],
+                                                     vc = x[3],
+                                                     lc = "emulsion")) - (2 - 0.4441)
+  
+    return(g1)
+}
+```
+
+Testing objective function and constraint.
+
+```{r}
+x_test <- c(0.875, 0.15, 40)
+MRR(x_test)
+g1(x_test)
+```
+
+Fitness function considering Objective function and penalty term regarding constraint.
+
+```{r}
+fitness <- function(x) 
+{ 
+  f <- MRR(x)                        
+  pen <- sqrt(.Machine$double.xmax)  # penalty term
+  penalty1 <- max(g1(x),0)*pen       # penalisation for 1st inequality constraint
+  f - penalty1                       # fitness function value
+}
+```
+
+Defining algorithims to the optimization.
+
+```{r}
+ALGOS <- c("ALO", "DA", "GWO", "MFO", "WOA")
+  
+#  c("ABC", "ALO", "BA", "BHO", "CLONALG", "CS", "CSO", "DA", "DE", "FFA", "GA", "GBS", "GOA", "GWO", "HS", "KH", "MFO", "PSO", "SCA", "SFL", "WOA")
+
+# Convergiram:
+# "ABC", "ALO", "DA", "DE", "GWO", "MFO", "PSO", "WOA"
+
+# Tempo satisfatorio entre os que convergiram:
+# "ALO", "DA", "GWO", "MFO", "WOA"
+```
+
+Optimization.
+
+```{r include = F}
+result_meta <- metaOpt(fitness, optimType="MAX", numVar = 3, 
+                       algorithm = ALGOS,  
+                       rangeVar = matrix(c(0.50, 0.1, 20, 
+                                           1.25, 0.2, 60),
+                                         nrow = 2,
+                                         byrow=T),
+                       control = list(numPopulation = 50, maxIter = 100))
+```
+
+```{r}
+result_meta
+```
+
+```{r, echo = F, inlcude = F}
+############################ RESULTADOS lc = "emulsion" #########################
+################# rodada 1
+# $result
+#          var1 var2 var3
+# ALO 0.9103112  0.2   60
+# DA  0.9103113  0.2   60
+# GWO 0.9103106  0.2   60
+# MFO 0.9103113  0.2   60
+# WOA 0.9103098  0.2   60
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1219.232
+# DA       1219.232
+# GWO      1219.231
+# MFO      1219.232
+# WOA      1219.230
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 52.67   1.86   54.61
+# DA  52.75   1.60   54.32
+# GWO 51.49   1.78   53.28
+# MFO 51.19   1.86   53.01
+# WOA 51.92   1.47   53.64
+
+################# rodada 2
+# $result
+#          var1 var2 var3
+# ALO 0.9103113  0.2   60
+# DA  0.9103113  0.2   60
+# GWO 0.9102447  0.2   60
+# MFO 0.9103113  0.2   60
+# WOA 0.9103108  0.2   60
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1219.232
+# DA       1219.232
+# GWO      1219.143
+# MFO      1219.232
+# WOA      1219.231
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.56   1.55   53.14
+# DA  53.00   1.31   54.36
+# GWO 51.30   1.74   53.02
+# MFO 51.34   1.59   52.95
+# WOA 51.43   1.59   53.05
+
+################# rodada 3
+# $result
+#          var1 var2     var3
+# ALO 0.9103113  0.2 60.00000
+# DA  0.9103110  0.2 60.00000
+# GWO 0.9100357  0.2 60.00000
+# MFO 0.9103113  0.2 60.00000
+# WOA 0.9288365  0.2 57.12942
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1219.232
+# DA       1219.232
+# GWO      1218.863
+# MFO      1219.232
+# WOA      1184.528
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.63   1.61   53.23
+# DA  52.81   1.28   54.11
+# GWO 51.33   1.60   52.96
+# MFO 50.94   1.79   52.71
+# WOA 51.14   1.71   52.92
+
+################# rodada 4
+# $result
+#          var1 var2     var3
+# ALO 0.9103113  0.2 60.00000
+# DA  0.9103113  0.2 60.00000
+# GWO 0.9102488  0.2 60.00000
+# MFO 0.9103113  0.2 60.00000
+# WOA 0.9297503  0.2 56.96061
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1219.232
+# DA       1219.232
+# GWO      1219.148
+# MFO      1219.232
+# WOA      1182.190
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.71   1.56   53.22
+# DA  52.75   1.61   54.33
+# GWO 50.95   1.75   52.75
+# MFO 51.30   1.42   52.67
+# WOA 51.36   1.46   52.82
+
+################# rodada 5
+# $result
+#          var1 var2 var3
+# ALO 0.9103113  0.2   60
+# DA  0.9103113  0.2   60
+# GWO 0.9101491  0.2   60
+# MFO 0.9103113  0.2   60
+# WOA 0.9103107  0.2   60
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1219.232
+# DA       1219.232
+# GWO      1219.015
+# MFO      1219.232
+# WOA      1219.231
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.47   1.50   52.92
+# DA  54.00   1.78   55.80
+# GWO 51.97   1.35   53.29
+# MFO 51.53   1.54   53.08
+# WOA 51.63   1.41   53.02
+```
+
+```{r, echo = F, inlcude = F}
+############################ RESULTADOS lc = "mql" #########################
+################# rodada 1
+# $result
+#          var1 var2     var3
+# ALO 0.7961491  0.2 58.44620
+# DA  0.8143632  0.2 57.15211
+# GWO 0.8147253  0.2 57.12499
+# MFO 0.8154892  0.2 57.07084
+# WOA 0.7735938  0.2 60.00000
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1038.701
+# DA       1038.941
+# GWO      1038.910
+# MFO      1038.898
+# WOA      1036.103
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.25   1.69   52.95
+# DA  52.38   1.63   53.93
+# GWO 50.80   1.67   52.53
+# MFO 50.75   1.62   52.39
+# WOA 50.63   1.82   52.42
+
+################# rodada 2
+# $result
+#          var1 var2     var3
+# ALO 0.8053972  0.2 57.79385
+# DA  0.8082306  0.2 57.59207
+# GWO 0.8004903  0.2 58.13456
+# MFO 0.7848576  0.2 59.23037
+# WOA 0.8510295  0.2 54.41712
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1039.039
+# DA       1039.054
+# GWO      1038.796
+# MFO      1037.707
+# WOA      1033.766
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.37   1.67   53.05
+# DA  52.80   1.39   54.22
+# GWO 51.19   1.85   53.00
+# MFO 51.35   1.56   52.88
+# WOA 51.43   1.54   53.05
+
+################# rodada 3
+# $result
+#          var1 var2     var3
+# ALO 0.8025153  0.2 57.99816
+# DA  0.7735939  0.2 60.00000
+# GWO 0.8164449  0.2 57.00097
+# MFO 0.7736002  0.2 59.99957
+# WOA 0.7735937  0.2 60.00000
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1038.981
+# DA       1036.103
+# GWO      1038.843
+# MFO      1036.104
+# WOA      1036.103
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.72   1.49   53.21
+# DA  52.94   1.50   54.45
+# GWO 51.61   1.47   53.11
+# MFO 51.17   1.53   52.77
+# WOA 51.10   1.80   52.90
+
+################# rodada 4
+# $result
+#          var1 var2     var3
+# ALO 0.7951343  0.2 58.51722
+# DA  0.7735939  0.2 60.00000
+# GWO 0.7978136  0.2 58.31893
+# MFO 0.7792735  0.2 59.61344
+# WOA 0.7735939  0.2 60.00000
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1038.637
+# DA       1036.103
+# GWO      1038.606
+# MFO      1036.987
+# WOA      1036.103
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.04   1.67   52.72
+# DA  52.64   1.23   53.92
+# GWO 51.66   1.78   53.44
+# MFO 51.20   1.49   52.64
+# WOA 51.11   1.62   52.74
+
+################# rodada 5
+# $result
+#          var1      var2     var3
+# ALO 0.8096857 0.2000000 57.48808
+# DA  0.8101027 0.2000000 57.45823
+# GWO 0.8052587 0.1999191 57.78863
+# MFO 0.7811078 0.2000000 59.48794
+# WOA 0.7735935 0.2000000 60.00000
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1039.046
+# DA       1039.041
+# GWO      1038.767
+# MFO      1037.239
+# WOA      1036.103
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.20   1.72   52.91
+# DA  52.43   1.72   54.13
+# GWO 51.11   1.65   52.81
+# MFO 51.27   1.46   52.70
+# WOA 50.58   1.89   52.49
+```
+
+```{r, echo = F, inlcude = F}
+# h_x_add_err <- function(x) {
+#   h <- as.numeric(predict(svm_final_fit, new_data = data.frame(fza = x[1],
+#                                                     fzt = x[2],
+#                                                     vc = x[3],
+#                                                     lc = "emulsion"))) - 2
+#   return(h)
+# }
+```
+
+```{r, echo = F, inlcude = F}
+# find_x1 <- function(x3, x2) {
+#   # Define um intervalo inicial para x1
+#   lower <- 0.7
+#   upper <- 1.1
+#   
+#   while (upper - lower > 1e-6) {
+#     mid <- (lower + upper) / 2
+#     result <- g1(c(mid, x2, x3))
+#     
+#     if (result == 0) {
+#       return(mid)
+#     } else if (result < 0) {
+#       lower <- mid
+#     } else {
+#       upper <- mid
+#     }
+#   }
+#   
+#   return((lower + upper) / 2)
+# }
+# 
+# x3_values <- seq(20, 60, length = 200)
+# x2 <- 0.200
+# x1_values <- sapply(x3_values, find_x1, x2 = x2)
+# 
+# # Exibir os resultados
+# result_df <- data.frame(x1 = x1_values, x3 = x3_values)
+
+```
+
+```{r, echo = F, inlcude = F}
+# find_x1_ <- function(x3, x2) {
+#   # Define um intervalo inicial para x1
+#   lower <- 0.8
+#   upper <- 1.25
+#   
+#   while (upper - lower > 1e-6) {
+#     mid <- (lower + upper) / 2
+#     result <- h_x_add_err(c(mid, x2, x3))
+#     
+#     if (result == 0) {
+#       return(mid)
+#     } else if (result < 0) {
+#       lower <- mid
+#     } else {
+#       upper <- mid
+#     }
+#   }
+#   
+#   return((lower + upper) / 2)
+# }
+# 
+# x3_values <- seq(35, 60, length = 200)
+# x1_values2 <- sapply(x3_values, find_x1_, x2 = x2)
+# 
+# # Exibir os resultados
+# result_df2 <- data.frame(x1 = x1_values2, x3 = x3_values)
+# # print(result_df)
+# 
+# x1 <- seq(0.5, 1.25, length = 200)
+# x3 <- seq(20, 60, length = 200)
+# xys <- expand.grid(x1=x1,
+#                    x3=x3)
+# xys <- data.frame(x1 = xys$x1,
+#                   x2 = 0.2,
+#                   x3 = xys$x3)
+# zs2 <- matrix(apply(xys,1,MRR), nrow = length(x1)) # previsao modelo MRR
+# 
+# contour(x=x1, y=x3, z=zs2, col = "royalblue3", #  "#C71585", 
+#         labcex = 1, method = "edge",
+#         xlab = "fza", ylab = "vc", lwd = 1.5)
+# lines(result_df, col = "red", lwd = 1.5)
+# lines(result_df2, col = "red", lty = 2, lwd = 1.5)
+# points(0.9103113, 60, pch = "*", col = "seagreen3", cex = 2)
+# legend(0.55, 25, legend=c("Ra = 2 - Err_T", "Ra = 2", "max{MRR}"),
+#        col=c("red", "red", "seagreen3"), lty=c(1:2,NA), pch = c(NA,NA,"*"), cex=0.8)
+```

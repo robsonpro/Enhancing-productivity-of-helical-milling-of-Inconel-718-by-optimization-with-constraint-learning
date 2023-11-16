@@ -1,0 +1,363 @@
+---
+title: "Ra modeling - Helical milling of Inconel 718 with round carbide inserts"
+author: "Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+## Libraries loading
+
+The following libraries must be loaded to perform the analysis.
+
+```{r message=F}
+library(rsm)
+library(MaxPro)
+library(dplyr)
+library(tidymodels)
+library(rules)
+library(baguette)
+library(finetune)
+library(GGally)
+```
+
+## Experimental design
+
+The experimental design is a Box-Behnken design augmented considering the maximum projection criteria.
+
+```{r}
+plan <- bbd(3,
+            n0 = 2,
+            coding = list(x1 ~ (fza - 0.875)/0.375,        # um/dente
+                          x2 ~ (fzt - 0.15)/0.05,   # mm/dente
+                          x3 ~ (vc - 40)/20),         # m/min
+            randomize = F)
+
+plan01 <- plan[,3:5]
+plan01$x1 <- (plan$x1 - min(plan$x1))/(max(plan$x1) - min(plan$x1))
+plan01$x2 <- (plan$x2 - min(plan$x2))/(max(plan$x2) - min(plan$x2))
+plan01$x3 <- (plan$x3 - min(plan$x3))/(max(plan$x3) - min(plan$x3))
+
+set.seed(7)
+plan_cand <- CandPoints(N = 6, p_cont = 3, l_disnum=NULL, l_nom=NULL)
+
+plan_rand <- MaxProAugment(as.matrix(plan01), plan_cand, nNew = 6,
+                           p_disnum=0, l_disnum=NULL, p_nom=0, l_nom=NULL)
+plan_rand2 <- data.frame(plan_rand$Design)
+colnames(plan_rand2) <- c("x1","x2", "x3")
+
+plan_rand2$x1 <- plan_rand2$x1*(max(plan$x1) - min(plan$x1)) + min(plan$x1)
+plan_rand2$x2 <- plan_rand2$x2*(max(plan$x2) - min(plan$x2)) + min(plan$x2)
+plan_rand2$x3 <- plan_rand2$x3*(max(plan$x3) - min(plan$x3)) + min(plan$x3)
+
+plan2 <- data.frame(plan_rand2)
+plan2$fza <- plan2$x1*0.375 + 0.875
+plan2$fzt <- plan2$x2*0.05 + 0.15
+plan2$vc  <- plan2$x3*20 + 40
+
+set.seed(5)
+plan2$run.order <- sample(1:nrow(plan2),nrow(plan2),replace=F)
+
+plan2
+```
+
+## Measurement results
+
+Initially measurements are stored in the design for both lubri-cooling types.
+
+```{r}
+plan_ <- rbind(plan2, plan2)
+
+rough <- c(1.9155556, 3.5155556, 1.0655556, 1.9655556, 1.7655556, 3.2655556, 1.1655556, 2.5655556, 3.1155556, 1.6655556, 3.2655556, 1.3655556, 1.9155556, 2.0155556, 1.9655556, 3.5155556, 0.9655556, 2.5155556, 1.6655556, 2.3155556, 1.6655556, 3.6155556, 0.7655556, 1.9655556, 0.8655556, 2.8155556, 1.0155556, 4.3155556, 2.9155556, 1.4155556, 4.7155556, 1.8655556, 1.8155556, 2.2155556, 1.7655556, 3.4655556, 0.8655556, 2.2155556, 2.3655556, 1.9155556)
+
+plan_ <- plan_ %>%
+  mutate(lc = rep(c("emulsion", "mql"), each = 20),
+         Ra = rough)
+
+plan_ <- plan_ %>%
+  select(fza,fzt,vc,lc,Ra)
+plan_
+```
+
+Visualization to see lubri-cooling influence on Ra.
+
+```{r}
+gg2 <- ggpairs(plan_, columns = 4:5, aes(colour = lc, alpha = 0.1),
+               lower = list(continuous = "cor" , combo ="box_no_facet"),
+               upper = list(continuous = "points", combo = "dot_no_facet")) + theme_bw()
+gg2
+```
+
+## Modeling and learning workflow
+
+### Data spliting
+
+The data is splitted to model training (75%) and validation (25%). The training data is used to tuning the hyperparameters of the models with a 10-fold cross-validation repeated twice.
+
+```{r}
+set.seed(1501)
+plan_split <- initial_split(plan_, strata = lc)
+  
+plan_train <- training(plan_split)
+plan_test  <- testing(plan_split)
+
+set.seed(1502)
+plan_folds <- 
+  vfold_cv(v = 10, plan_train, repeats = 2)
+
+plan_test
+```
+
+### Recipes
+
+A normalized recipe is conceived to avoid scale and measurement units effects all numerical variables (fza, fzt, and vc) are standardized. The categorical variable (lubri-cooling) was defined as dummy variable.
+
+```{r}
+normalized_rec <- 
+  recipe(Ra ~ ., data = plan_train) %>% 
+  step_normalize(fza,fzt,vc) %>%
+  step_dummy(all_nominal_predictors())
+
+# poly_recipe <- 
+#   normalized_rec %>% 
+#   step_poly(fza,fzt,vc) %>% 
+#   step_interact(~ all_predictors():all_predictors())
+```
+
+### Models
+
+Seven model types were defined: linear regression, neural networks, support vector machine (with radial and polynomial kernels), k-nearest neighbors, extreme gradient boosting, and cubist.
+
+```{r}
+linear_reg_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+
+nnet_spec <- 
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+  set_engine("nnet", MaxNWts = 2600) %>% 
+  set_mode("regression")
+
+svm_r_spec <- 
+  svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+svm_p_spec <- 
+  svm_poly(cost = tune(), degree = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+knn_spec <- 
+  nearest_neighbor(neighbors = tune(), dist_power = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression")
+
+xgb_spec <- 
+  boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+             min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+cubist_spec <- 
+ cubist_rules(committees = tune(), neighbors = tune()) %>% 
+ set_engine("Cubist") 
+
+nnet_param <- 
+  nnet_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(hidden_units = hidden_units(c(1, 27)))
+```
+
+### Workflows
+
+Two workflow is defined considering all methods, predictors, and response.
+
+```{r}
+normalized <- 
+  workflow_set(
+    preproc = list(normalized = normalized_rec), 
+    models = list(linear_reg = linear_reg_spec,
+                  SVM_radial = svm_r_spec, 
+                  SVM_poly = svm_p_spec, 
+                  KNN = knn_spec, 
+                  neural_network = nnet_spec, 
+                  XGB = xgb_spec,
+                  Cubist = cubist_spec)
+  )
+normalized
+
+normalized <- 
+  normalized %>% 
+  option_add(param_info = nnet_param, id = "normalized_neural_network")
+normalized
+
+all_workflows <- 
+  bind_rows(normalized) %>% 
+  # Make the workflow ID's a little more simple: 
+  mutate(wflow_id = gsub("(simple_)|(normalized_)", "", wflow_id))
+all_workflows
+```
+
+### Model tuning
+
+Tuning of the models is performed considering a grid of 25 combinations of the levels of the hyperparameters.
+
+```{r message = F}
+race_ctrl <-
+  control_race(
+    save_pred = TRUE,
+    parallel_over = "everything",
+    save_workflow = TRUE
+  )
+
+race_results <-
+  all_workflows %>%
+  workflow_map(
+    "tune_race_anova",
+    seed = 1503,
+    resamples = plan_folds,
+    grid = 25,
+    control = race_ctrl
+  )
+```
+
+Results of tuning of all methods in all hyperparameter combinations of the grid.
+
+```{r}
+race_results
+```
+
+Resuls are sorted considering RMSE.
+
+```{r}
+collect_metrics(race_results) %>% 
+  filter(.metric == "rmse") %>%
+  arrange(mean)
+```
+
+Resuls are sorted considering R^2.
+
+```{r}
+collect_metrics(race_results) %>% 
+  filter(.metric == "rsq") %>%
+  arrange(desc(mean))
+```
+
+Plotting performance of the methods considering both metrics. 
+
+```{r, include = F, echo = F}
+# autoplot(
+#   race_results,
+#   # rank_metric = "rmse",  
+#   # metric = "rmse",       
+#   select_best = TRUE    
+# ) +
+#   geom_text(aes(y = mean - 1/2, label = wflow_id), angle = 90, hjust = .05) +
+#   # lims(y = c(3.0, 9.5)) 
+#   theme_bw()  +
+#   theme(legend.position = "none")
+```
+
+```{r}
+IC_rmse <- collect_metrics(race_results) %>% 
+  filter(.metric == "rmse") %>% 
+  group_by(wflow_id) %>%
+  filter(mean == min(mean)) %>%
+  group_by(wflow_id) %>% 
+  arrange(mean) %>% 
+  ungroup()
+
+IC_r2 <- collect_metrics(race_results) %>% 
+  filter(.metric == "rsq") %>% 
+  group_by(wflow_id) %>%
+  filter(mean == max(mean)) %>%
+  group_by(wflow_id) %>% 
+  arrange(desc(mean)) %>% 
+  ungroup() 
+
+IC <- bind_rows(IC_rmse, IC_r2)
+
+ggplot(IC, aes(x = factor(wflow_id, levels = unique(wflow_id)), y = mean)) +
+  facet_wrap(~.metric) +
+  geom_point(stat="identity", aes(color = wflow_id), pch = 1) +
+  geom_errorbar(stat="identity", aes(color = wflow_id, 
+                                     ymin=mean-1.96*std_err,
+                                     ymax=mean+1.96*std_err), width=.2) + 
+  labs(y = "", x = "method") + theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Performance in the test data.
+
+```{r}
+best_rmse <- 
+  race_results %>% 
+  extract_workflow_set_result("Cubist") %>% 
+  select_best(metric = "rmse")
+best_rmse
+
+Cubist_test_results <- 
+  race_results %>% 
+  extract_workflow("Cubist") %>% 
+  finalize_workflow(best_rmse) %>% 
+  last_fit(split = plan_split)
+
+collect_metrics(Cubist_test_results)
+```
+
+```{r}
+best_rmse2 <- 
+  race_results %>% 
+  extract_workflow_set_result("SVM_radial") %>% 
+  select_best(metric = "rmse")
+best_rmse2
+
+SVM_radial_test_results <- 
+  race_results %>% 
+  extract_workflow("SVM_radial") %>% 
+  finalize_workflow(best_rmse2) %>% 
+  last_fit(split = plan_split)
+
+collect_metrics(SVM_radial_test_results)
+```
+
+```{r message = F, echo = F, fig.show='hide'}
+Cubist_test_results %>% 
+  collect_predictions() %>% 
+  ggplot(aes(x = Ra, y = .pred)) + 
+  geom_abline(color = "gray50", lty = 2) + 
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred() + 
+  labs(x = "observed", y = "predicted") + 
+  theme_bw()
+```
+
+```{r message = F, echo = F, fig.show='hide'}
+SVM_radial_test_results %>% 
+  collect_predictions() %>% 
+  ggplot(aes(x = Ra, y = .pred)) + 
+  geom_abline(color = "gray50", lty = 2) + 
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred() + 
+  labs(x = "observed", y = "predicted") + 
+  theme_bw()
+```
+
+Plotting predicted versus observed Ra.
+
+```{r}
+test_results <- rbind(Cubist_test_results %>% collect_predictions(),
+                      SVM_radial_test_results %>% collect_predictions())
+test_results$method <- c(rep("Cubist", nrow(Cubist_test_results %>% collect_predictions())),
+                         rep("SVM_radial", nrow(SVM_radial_test_results %>% collect_predictions()))) 
+
+test_results %>%
+  ggplot(aes(x = Ra, y = .pred)) + 
+  facet_grid(cols = vars(method)) +
+  geom_abline(color = "gray50", lty = 2) + 
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred() + 
+  labs(x = "observed", y = "predicted") + 
+  theme_bw()
+```
