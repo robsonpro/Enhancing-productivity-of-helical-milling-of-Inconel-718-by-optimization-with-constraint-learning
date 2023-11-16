@@ -2,14 +2,14 @@
 
 Repository with code and data of the paper "Enhancing productivity of helical milling of Inconel 718 by optimization with constraint learning" to be published on ...
 
-The code is divided into five documents as follows:
+The code is divided into five documents as follows: 
 
-Initial learning of roughness constraint:
+Initial learning of roughness constraint: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/Roughness_modeling.html
 
-Cubist constraint tuning with a wider grid:
+Cubist constraint tuning with a wider grid: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/Roughness_modeling1.html
 
-SVR constraint tuning with a wider grid:
+SVR constraint tuning with a wider grid: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/Roughness_modeling2.html
 
-MRR optimization considering Cubist constraint:
+MRR optimization considering Cubist constraint: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/MRR_optim_const_learning1.html
 
-MRR optimization considering SVR constraint:
+MRR optimization considering SVR constraint: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/MRR_optim_const_learning2.html
