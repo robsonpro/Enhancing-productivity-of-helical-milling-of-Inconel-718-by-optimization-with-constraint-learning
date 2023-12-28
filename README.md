@@ -13,3 +13,7 @@ SVR constraint tuning with a wider grid: https://robsonpro.github.io/Enhancing-p
 MRR optimization considering Cubist constraint: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/MRR_optim_const_learning1.html
 
 MRR optimization considering SVR constraint: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/MRR_optim_const_learning2.html
+
+CART constraint tuning: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/Roughness_reg_CART.html
+
+MRR optimization considering CART constraint and nonlinear programming for comparison: https://robsonpro.github.io/Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning/MRR_optim_const_learning_CART.html
