@@ -1,0 +1,371 @@
+---
+title: "MRR optimization subject to roughness constraint learning with classification constraint"
+author: "Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+## Loading libraries, defining experimental design, and getting measurement results.
+
+The same as done previously.
+
+```{r message = F, echo = F}
+library(rsm)
+library(MaxPro)
+library(dplyr)
+library(tidymodels)
+library(rules)
+library(baguette)
+library(finetune)
+library(ggpubr)
+library(DALEX)
+library(DALEXtra)
+library(forcats)
+library(metaheuristicOpt)
+```
+
+```{r message = F, echo = F}
+
+plan <- bbd(3,
+            n0 = 2,
+            coding = list(x1 ~ (fza - 0.875)/0.375,        # um/dente
+                          x2 ~ (fzt - 0.15)/0.05,   # mm/dente
+                          x3 ~ (vc - 40)/20),         # m/min
+            randomize = F)
+
+plan01 <- plan[,3:5]
+plan01$x1 <- (plan$x1 - min(plan$x1))/(max(plan$x1) - min(plan$x1))
+plan01$x2 <- (plan$x2 - min(plan$x2))/(max(plan$x2) - min(plan$x2))
+plan01$x3 <- (plan$x3 - min(plan$x3))/(max(plan$x3) - min(plan$x3))
+
+set.seed(7)
+plan_cand <- CandPoints(N = 6, p_cont = 3, l_disnum=NULL, l_nom=NULL)
+
+plan_rand <- MaxProAugment(as.matrix(plan01), plan_cand, nNew = 6,
+                           p_disnum=0, l_disnum=NULL, p_nom=0, l_nom=NULL)
+plan_rand2 <- data.frame(plan_rand$Design)
+colnames(plan_rand2) <- c("x1","x2", "x3")
+
+plan_rand2$x1 <- plan_rand2$x1*(max(plan$x1) - min(plan$x1)) + min(plan$x1)
+plan_rand2$x2 <- plan_rand2$x2*(max(plan$x2) - min(plan$x2)) + min(plan$x2)
+plan_rand2$x3 <- plan_rand2$x3*(max(plan$x3) - min(plan$x3)) + min(plan$x3)
+
+plan2 <- data.frame(plan_rand2)
+plan2$fza <- plan2$x1*0.375 + 0.875
+plan2$fzt <- plan2$x2*0.05 + 0.15
+plan2$vc  <- plan2$x3*20 + 40
+
+set.seed(5)
+plan2$run.order <- sample(1:nrow(plan2),nrow(plan2),replace=F)
+
+```
+
+```{r message = F, echo = F}
+setwd("D:/OneDrive - Universidade Federal de São João del-Rei/HM_nickel_superalloys/Resultados_round")
+
+roughness <- read.csv("rugosidade.csv", header = T)
+
+roughness <- roughness %>%
+  rowwise() %>%
+  mutate(Ra = mean(c_across(c('Ra1','Ra2','Ra3', 'Ra4')), na.rm=TRUE),
+            Ra_sd = sd(c_across(c('Ra1','Ra2','Ra3', 'Ra4')), na.rm=TRUE))
+
+
+plan_ <- rbind(plan2, plan2)
+
+plan_ <- plan_ %>%
+  mutate(lc = roughness$lc,
+         Ra = roughness$Ra)
+
+plan_ <- plan_ %>%
+  dplyr::select(fza,fzt,vc,lc,Ra)
+
+plan_ <- plan_ %>%
+  mutate(Ra_class = case_when(Ra < 2 ~ "1",
+                              Ra == 2 ~ "1",
+                              Ra > 2 ~ "0"))
+plan_ <- plan_ %>% select(-c(Ra))
+
+plan_ <- plan_ %>% mutate(
+    Ra_class = factor(Ra_class))
+```
+
+```{r message = F, echo = F}
+set.seed(1507)
+plan_split <- initial_split(plan_, strata = lc)
+  
+plan_train <- training(plan_split)
+plan_test  <- testing(plan_split)
+
+set.seed(1504)
+plan_folds <- 
+  vfold_cv(v = 5, plan_train, repeats = 2)
+
+```
+
+### CART
+
+```{r}
+normalized_rec <- 
+  recipe(Ra_class ~ ., data = plan_train) %>% 
+  step_normalize(fza,fzt,vc) %>%
+  step_dummy(all_nominal_predictors())
+
+cart_spec <- 
+  decision_tree(cost_complexity = 1e-10, min_n = 2, tree_depth = 2) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+cart_wflow <- 
+  workflow() %>%
+    add_model(cart_spec) %>%
+  add_recipe(normalized_rec)
+
+
+cart_final_fit <- fit(cart_wflow, data = plan_train)
+```
+
+```{r}
+cart_fit <- cart_final_fit %>% 
+  extract_fit_parsnip()
+
+cart_fit
+```
+
+```{r}
+augment(cart_final_fit, new_data = plan_test) %>%
+  accuracy(truth = Ra_class, estimate = .pred_class)
+```
+
+### Optimization of material removal rate with Ra contraint learning
+
+First MRR function is defined.
+
+```{r}
+MRR <- function(x){
+
+  z <- 2
+  Db <- 25
+  Dt <- 14
+  Dh <- Db-Dt
+
+  f1 <- 250*z*(Db^3/(Dh*Dt))*x[3]*((x[1]*10^-3)/x[2])*sqrt((x[1]*10^-3)^2 + (x[2]*Dh/Db)^2)
+  
+  return(f1)
+} 
+```
+
+Writing LREG constraint... Change LC (`"emulsion"` or `"mql"`) as desired...
+
+```{r}
+h_x <- function(x) {
+  # 0.5 + Err_T = 0.5 + 0.1 = 0.1
+  h <- 0.1 - predict(cart_final_fit, new_data = data.frame(fza = x[1],
+                                                            fzt = x[2],
+                                                            vc = x[3],
+                                                            lc = "mql"),
+                        type = "prob")$.pred_1
+  
+  return(h)
+}
+```
+
+Testing objective function and constraint.
+
+```{r}
+x_test <- c(0.875, 0.15, 40)
+MRR(x_test)
+h_x(x_test)
+```
+
+Fitness function considering Objective function and penalty term regarding constraint.
+
+```{r}
+fitness <- function(x) 
+{ 
+  f <- MRR(x)                        
+  pen <- sqrt(.Machine$double.xmax)  # penalty term
+  penalty1 <- max(h_x(x),0)*pen       # penalisation for 1st inequality constraint
+  f - penalty1                       # fitness function value
+}
+```
+
+Defining algorithms to the optimization.
+
+```{r}
+ALGOS <- c("ALO", "DA", "GWO", "MFO", "WOA")
+  
+#  c("ABC", "ALO", "BA", "BHO", "CLONALG", "CS", "CSO", "DA", "DE", "FFA", "GA", "GBS", "GOA", "GWO", "HS", "KH", "MFO", "PSO", "SCA", "SFL", "WOA")
+
+# Convergiram:
+# "ABC", "ALO", "DA", "DE", "GWO", "MFO", "PSO", "WOA"
+
+# Tempo satisfatorio entre os que convergiram:
+# "ALO", "DA", "GWO", "MFO", "WOA"
+```
+
+Optimization.
+
+```{r}
+result_meta <- metaOpt(fitness, optimType="MAX", numVar = 3, 
+                       algorithm = ALGOS,  
+                       rangeVar = matrix(c(0.50, 0.1, 20, 
+                                           1.25, 0.2, 60),
+                                         nrow = 2,
+                                         byrow=T),
+                       control = list(numPopulation = 50, 
+                                      maxIter = 100))
+```
+
+```{r}
+result_meta
+```
+
+```{r}
+############################ RESULTADOS lc = "emulsion" #########################
+################# rodada 1
+# $result
+#     var1      var2 var3
+# ALO 1.25 0.1958333   60
+# DA  1.25 0.1958333   60
+# GWO 1.25 0.1958335   60
+# MFO 1.25 0.1958333   60
+# WOA 1.25 0.1958334   60
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1674.283
+# DA       1674.283
+# GWO      1674.283
+# MFO      1674.283
+# WOA      1674.283
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 51.55   1.88   53.51
+# DA  63.08   1.89   66.69
+# GWO 58.24   1.78   60.71
+# MFO 54.95   1.84   57.25
+# WOA 56.64   1.68   58.78
+
+```
+
+```{r}
+############################ RESULTADOS lc = "mql" #########################
+################# rodada 1
+# $result
+#     var1      var2 var3
+# ALO 1.25 0.1958334   60
+# DA  1.25 0.1958333   60
+# GWO 1.25 0.1958820   60
+# MFO 1.25 0.1958333   60
+# WOA 1.25 0.1958334   60
+# 
+# $optimumValue
+#     optimum_value
+# ALO      1674.283
+# DA       1674.283
+# GWO      1674.283
+# MFO      1674.283
+# WOA      1674.283
+# 
+# $timeElapsed
+#      user system elapsed
+# ALO 53.29   1.84   55.39
+# DA  48.40   1.78   50.16
+# GWO 48.36   1.72   50.11
+# MFO 51.58   1.94   53.77
+# WOA 50.44   1.75   52.35
+
+```
+
+### plotting decision space with objective function and learned constraint
+
+```{r}
+h_x_add_err <- function(x) {
+  h <- 0.5 - predict(lreg_final_fit, new_data = data.frame(fza = x[1],
+                                                            fzt = x[2],
+                                                            vc = x[3],
+                                                            lc = "emulsion"),
+                        type = "prob")$.pred_1
+  
+  return(h)
+}
+```
+
+```{r}
+find_x1 <- function(x3, x2) {
+  # Define um intervalo inicial para x1
+  lower <- 1
+  upper <- 1.25
+  
+  while (upper - lower > 1e-6) {
+    mid <- (lower + upper) / 2
+    result <- h_x(c(mid, x2, x3))
+    
+    if (result == 0) {
+      return(mid)
+    } else if (result < 0) {
+      lower <- mid
+    } else {
+      upper <- mid
+    }
+  }
+  
+  return((lower + upper) / 2)
+}
+
+x3_values <- seq(20, 60, length = 200)
+x2 <- 0.200
+x1_values <- sapply(x3_values, find_x1, x2 = x2)
+
+# Exibir os resultados
+result_df <- data.frame(x1 = x1_values, x3 = x3_values)
+
+```
+
+```{r}
+# find_x1_ <- function(x3, x2) {
+#   # Define um intervalo inicial para x1
+#   lower <- 0.9
+#   upper <- 1.2
+#   
+#   while (upper - lower > 1e-6) {
+#     mid <- (lower + upper) / 2
+#     result <- h_x_add_err(c(mid, x2, x3))
+#     
+#     if (result == 0) {
+#       return(mid)
+#     } else if (result < 0) {
+#       lower <- mid
+#     } else {
+#       upper <- mid
+#     }
+#   }
+#   
+#   return((lower + upper) / 2)
+# }
+# 
+# x3_values <- seq(20, 60, length = 200)
+# x1_values2 <- sapply(x3_values, find_x1_, x2 = x2)
+# 
+# # Exibir os resultados
+# result_df2 <- data.frame(x1 = x1_values2, x3 = x3_values)
+# # print(result_df)
+
+x1 <- seq(0.5, 1.25, length = 200)
+x3 <- seq(20, 60, length = 200)
+xys <- expand.grid(x1=x1,
+                   x3=x3)
+xys <- data.frame(x1 = xys$x1,
+                  x2 = 0.2,
+                  x3 = xys$x3)
+zs2 <- matrix(apply(xys,1,MRR), nrow = length(x1)) # previsao modelo MRR
+
+contour(x=x1, y=x3, z=zs2, col = "royalblue3", #  "#C71585", 
+        labcex = 1, method = "edge",
+        xlab = "fza", ylab = "vc", lwd = 1.5)
+lines(result_df, col = "red", lwd = 1.5)
+# lines(result_df2, col = "red", lty = 2, lwd = 1.5)
+points(1.09672, 60, pch = "*", col = "seagreen3", cex = 2)
+```

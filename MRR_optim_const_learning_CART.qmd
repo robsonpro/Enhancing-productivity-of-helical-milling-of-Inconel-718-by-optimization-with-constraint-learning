@@ -188,7 +188,7 @@ ALGOS <- c("ALO", "DA", "GWO", "MFO", "WOA")
 ```
 
 
-```{r message = F, echo = F}
+```{r message = F, echo = F, include=F}
 result_meta <- metaOpt(fitness, optimType="MAX", numVar = 3, 
                        algorithm = ALGOS,  
                        rangeVar = matrix(c(0.50, 0.1, 20, 
