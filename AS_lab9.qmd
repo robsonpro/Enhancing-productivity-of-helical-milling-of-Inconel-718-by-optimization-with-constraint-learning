@@ -1,0 +1,467 @@
+---
+title: "Laboratório 9 - Regressão via pacote tidymodels"
+author: "Robson Bruno Dutra Pereira"
+format: html
+editor: visual
+---
+
+## Exemplo: Previsão do salário de jogadores de Baisebol das ligas americanas usando pacote `tidymodels`
+
+Carregando pacotes.
+
+```{r}
+#| message: false
+#| warning: false
+library(tidymodels)
+library(modelsummary)
+library(finetune)
+library(dplyr)
+library(baguette)
+```
+
+Leitura de dados.
+
+```{r}
+data(Hitters, package = "ISLR")
+dados <- na.omit(Hitters)
+```
+
+Entendendo os dados.
+
+```{r}
+dados |> glimpse()
+```
+
+Estatisticas descritivas.
+
+```{r}
+datasummary_skim(dados)
+```
+
+Separando dados de treino e teste. Aqui consideramos 75% dos dados para treino do modelo, sendo estes selecionados de forma balanceada considerando a variável categórica *League*. Com o comando `vfold_cv` foi definida um particionamento dos dados em 10 dobras para validação via k-fold. Foram consideradas duas repetições.
+
+
+```{r}
+set.seed(16)
+dados_split <- initial_split(dados, 
+                            prop = 0.75,
+                            strata = League)
+  
+dados_train <- training(dados_split)
+dados_test  <- testing(dados_split)
+
+set.seed(17)
+dados_folds <- 
+  vfold_cv(v = 10, dados_train, repeats = 2)
+```
+
+Definindo uma receita. A receita contém tratamentos a serem aplicados nos dados, além do modelo a ser previsto. Pode-se por exemlpo normalizar as variáveis numéricas e transformar em *dummy* as variáveis categóricas.
+
+```{r}
+normalized_rec <- 
+  recipe(Salary ~ ., data = dados_train) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) 
+```
+
+Definindo os métodos de regressão a serem testados. Deve-se definir os hiperparâmetros a serem testados e o pacote (`engine`), uma vez que geralmente há várias opções de pacotes no R para um mesmo modelo.
+
+```{r}
+linear_reg_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) |> 
+  set_engine("glmnet")
+
+tree_spec <- decision_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) |> 
+  set_engine("rpart") |> 
+  set_mode("regression")
+
+bag_cart_spec <- 
+   bag_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) |> 
+   set_engine("rpart") |> 
+   set_mode("regression")
+
+rforest_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = tune()) |> 
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+xgb_spec <- # evolution of GBM
+  boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+             min_n = tune(), sample_size = tune(), trees = tune()) |> 
+  set_engine("xgboost") |> 
+  set_mode("regression")
+
+svm_r_spec <- 
+  svm_rbf(cost = tune(), rbf_sigma = tune()) |> 
+  set_engine("kernlab") |> 
+  set_mode("regression")
+
+svm_p_spec <- 
+  svm_poly(cost = tune(), degree = tune()) |> 
+  set_engine("kernlab") |> 
+  set_mode("regression")
+
+mars_spec <- # method similar to GAM
+   mars(prod_degree = tune()) %>%  
+   set_engine("earth") %>% 
+   set_mode("regression")
+
+nnet_spec <- 
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) |> 
+  set_engine("nnet", MaxNWts = 2600) |> 
+  set_mode("regression")
+
+nnet_param <- 
+  nnet_spec |> 
+  extract_parameter_set_dials() |> 
+  update(hidden_units = hidden_units(c(1, 27)))
+```
+
+Definindo o `worflow`, o qual contém os modelos e a receita.
+
+```{r}
+normalized <- 
+  workflow_set(
+    preproc = list(normalized = normalized_rec), 
+    models = list(linear_reg = linear_reg_spec,
+                  tree = tree_spec,
+                  bagging = bag_cart_spec,
+                  rforest = rforest_spec,
+                  XGB = xgb_spec,
+                  SVM_radial = svm_r_spec, 
+                  SVM_poly = svm_p_spec,
+                  MARS = mars_spec,
+                  neural_network = nnet_spec)
+  )
+normalized
+```
+
+Fazendo modificação no nome dos modelos para simplificá-los.
+
+```{r}
+all_workflows <- 
+  bind_rows(normalized) |> 
+  # Make the workflow ID's a little more simple: 
+  mutate(wflow_id = gsub("(simple_)|(normalized_)", "", wflow_id))
+all_workflows
+```
+
+Realizando *grid search* e validação cruzada. Deve-se definir o número de combinações no *grid*, além de fornecer o `workflow` e as dobras para validação cruzada, ambos definidos anteriormente.
+
+```{r}
+race_ctrl <-
+  control_race(
+    save_pred = TRUE,
+    parallel_over = "everything",
+    save_workflow = TRUE
+  )
+
+race_results <-
+  all_workflows |>
+  workflow_map(
+    "tune_race_anova",
+    seed = 1503,
+    resamples = dados_folds,
+    grid = 25,
+    control = race_ctrl
+  )
+```
+
+Extraindo métricas para avaliar os resultados da validação cruzada.
+
+```{r}
+collect_metrics(race_results) |> 
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+```{r}
+collect_metrics(race_results) |> 
+  filter(.metric == "rsq") |>
+  arrange(desc(mean))
+```
+
+Visualizando desempenho dos métodos.
+
+```{r}
+IC_rmse <- collect_metrics(race_results) |> 
+  filter(.metric == "rmse") |> 
+  group_by(wflow_id) |>
+  filter(mean == min(mean)) |>
+  group_by(wflow_id) |> 
+  arrange(mean) |> 
+  ungroup()
+
+IC_r2 <- collect_metrics(race_results) |> 
+  filter(.metric == "rsq") |> 
+  group_by(wflow_id) |>
+  filter(mean == max(mean)) |>
+  group_by(wflow_id) |> 
+  arrange(desc(mean)) |> 
+  ungroup() 
+
+IC <- bind_rows(IC_rmse, IC_r2)
+
+ggplot(IC, aes(x = factor(wflow_id, levels = unique(wflow_id)), y = mean)) +
+  facet_wrap(~.metric, scales = "free") +
+  geom_point(stat="identity", aes(color = wflow_id), pch = 1) +
+  geom_errorbar(stat="identity", aes(color = wflow_id, 
+                                     ymin=mean-1.96*std_err,
+                                     ymax=mean+1.96*std_err), width=.2) + 
+  labs(y = "", x = "method") + theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Obtendo níveis ótimos dos hiperparâmetros do melhor modelo.
+
+```{r}
+best_rmse <- 
+  race_results |> 
+  extract_workflow_set_result("rforest") |> 
+  select_best(metric = "rmse")
+best_rmse
+```
+
+
+```{r}
+rforest_test_results <- 
+  race_results |> 
+  extract_workflow("rforest") |> 
+  finalize_workflow(best_rmse) |> 
+  last_fit(split = dados_split)
+
+collect_metrics(rforest_test_results)
+```
+
+Plotando resultados previsto *versus* observados para os dados de teste. 
+
+```{r}
+test_results <- rbind(rforest_test_results |>
+                        collect_predictions())
+
+test_results |>
+  ggplot(aes(x = Salary, y = .pred)) + 
+  geom_abline(color = "gray50", lty = 2) + 
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred() + 
+  labs(x = "observed", y = "predicted") + 
+  theme_bw()
+```
+
+## Exemplo 2: Previsão do preço de computadores usando `tidymodels`
+
+```{r}
+#| message: false
+#| warning: false
+library(Ecdat)
+```
+
+Leitura de dados.
+
+```{r}
+data(Computers)
+dados2 <- na.omit(Computers)
+```
+
+Entendendo os dados.
+
+```{r}
+dados2 |> glimpse()
+```
+
+Estatísticas descritivas.
+
+```{r}
+datasummary_skim(dados2)
+```
+
+Criando coluna com combinações das variáveis categóricas que tem níveis desbalanceados.
+
+```{r}
+dados2 <- dados2 |>
+  mutate(multi_premium = paste(multi, premium,  
+                               sep = '_'))
+```
+
+Separando dados de treino e teste.
+
+```{r}
+set.seed(16)
+dados_split2 <- initial_split(dados2, 
+                              prop = 0.25,
+                              strata = multi_premium)
+  
+dados_train2 <- training(dados_split2)
+dados_test2  <- testing(dados_split2)
+
+set.seed(17)
+dados_folds2 <- 
+  vfold_cv(v = 10, dados_train2, repeats = 2)
+```
+
+Receita.
+
+```{r}
+normalized_rec2 <- 
+  recipe(price ~ speed + hd + ram + screen + cd + multi + premium + ads + trend, 
+         data = dados_train2) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) 
+```
+
+Workflow.
+
+```{r}
+normalized2 <- 
+  workflow_set(
+    preproc = list(normalized = normalized_rec2), 
+    models = list(linear_reg = linear_reg_spec,
+                  tree = tree_spec,
+                  bagging = bag_cart_spec,
+                  rforest = rforest_spec,
+                  XGB = xgb_spec,
+                  SVM_radial = svm_r_spec, 
+                  SVM_poly = svm_p_spec,
+                  MARS = mars_spec,
+                  neural_network = nnet_spec)
+  )
+normalized2
+```
+
+```{r}
+all_workflows2 <- 
+  bind_rows(normalized2) |> 
+  # Make the workflow ID's a little more simple: 
+  mutate(wflow_id = gsub("(simple_)|(normalized_)", "", wflow_id))
+all_workflows2
+```
+
+Realizando *grid search* e validação cruzada.
+
+```{r}
+race_results2 <-
+  all_workflows2 |>
+  workflow_map(
+    "tune_race_anova",
+    seed = 1503,
+    resamples = dados_folds2,
+    grid = 25,
+    control = race_ctrl
+  )
+```
+
+Extraindo métricas para avaliar os resultados da validação cruzada.
+
+```{r}
+collect_metrics(race_results2) |> 
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+```{r}
+collect_metrics(race_results2) |> 
+  filter(.metric == "rsq") |>
+  arrange(desc(mean))
+```
+
+Visualizando desempenho dos métodos.
+
+```{r}
+IC_rmse2 <- collect_metrics(race_results2) |> 
+  filter(.metric == "rmse") |> 
+  group_by(wflow_id) |>
+  filter(mean == min(mean)) |>
+  group_by(wflow_id) |> 
+  arrange(mean) |> 
+  ungroup()
+
+IC_r22 <- collect_metrics(race_results2) |> 
+  filter(.metric == "rsq") |> 
+  group_by(wflow_id) |>
+  filter(mean == max(mean)) |>
+  group_by(wflow_id) |> 
+  arrange(desc(mean)) |> 
+  ungroup() 
+
+IC2 <- bind_rows(IC_rmse2, IC_r22)
+
+ggplot(IC2, aes(x = factor(wflow_id, levels = unique(wflow_id)), y = mean)) +
+  facet_wrap(~.metric, scales = "free") +
+  geom_point(stat="identity", aes(color = wflow_id), pch = 1) +
+  geom_errorbar(stat="identity", aes(color = wflow_id, 
+                                     ymin=mean-1.96*std_err,
+                                     ymax=mean+1.96*std_err), width=.2) + 
+  labs(y = "", x = "method") + theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Obtendo níveis ótimos dos hiperparâmetros do melhor modelo.
+
+```{r}
+best_rmse2 <- 
+  race_results2 |> 
+  extract_workflow_set_result("XGB") |> 
+  select_best(metric = "rmse")
+best_rmse2
+```
+
+```{r}
+XGB_test_results <- 
+  race_results2 |> 
+  extract_workflow("XGB") |> 
+  finalize_workflow(best_rmse2) |> 
+  last_fit(split = dados_split2)
+
+collect_metrics(XGB_test_results)
+```
+
+Plotando resultados previsto *versus* observados para os dados de teste dos dois melhores métodos.
+
+```{r}
+best_rmse2_2 <- 
+  race_results2 |> 
+  extract_workflow_set_result("rforest") |> 
+  select_best(metric = "rmse")
+best_rmse2_2
+```
+
+```{r}
+rf_test_results <- 
+  race_results2 |> 
+  extract_workflow("rforest") |> 
+  finalize_workflow(best_rmse2_2) |> 
+  last_fit(split = dados_split2)
+
+collect_metrics(rf_test_results)
+```
+
+```{r}
+test_results2 <- rbind(XGB_test_results |>
+                        collect_predictions(),
+                       rf_test_results |>
+                        collect_predictions())
+
+test_results2$method <- c(rep("XGB", nrow(XGB_test_results |>
+                        collect_predictions())),
+                         rep("rforest", nrow(rf_test_results |>
+                        collect_predictions())))
+
+test_results2 |>
+  ggplot(aes(x = price, y = .pred)) + 
+  geom_abline(color = "gray50", lty = 2) + 
+  geom_point(alpha = 0.2) + 
+  facet_grid(col = vars(method)) +
+  coord_obs_pred() + 
+  labs(x = "observed", y = "predicted") + 
+  theme_bw()
+```
+
+Modelo final.
+
+```{r}
+XGB_final <- race_results2 |> 
+  extract_workflow("XGB") |> 
+  finalize_workflow(best_rmse2)
+XGB_final
+```
