@@ -1,6 +1,8 @@
 # Enhancing-productivity-of-helical-milling-of-Inconel-718-by-optimization-with-constraint-learning
 
-Repository with code and data of the paper "Enhancing productivity of helical milling of Inconel 718 by optimization with constraint learning" to be published on ...
+Repository with code and data of the paper "Enhancing productivity of helical milling of Inconel 718 by optimization with constraint learning" published in "The International Journal of Advanced Manufacturing Technology".
+
+Pereira, R.B.D., Gómez-Escudero, G., Calleja-Ochoa, A. et al. Enhancing productivity of helical milling of Inconel 718 by optimization with constraint learning. Int J Adv Manuf Technol 138, 783–804 (2025). https://doi.org/10.1007/s00170-025-15574-z
 
 The code is divided into five documents as follows: 
 
